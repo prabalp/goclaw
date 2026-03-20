@@ -57,9 +57,24 @@ func markdownToTelegramHTML(text string) string {
 	codeBlocks := extractCodeBlocks(text)
 	text = codeBlocks.text
 
-	// Extract and protect inline code
+	// Extract and protect inline codes
 	inlineCodes := extractInlineCodes(text)
 	text = inlineCodes.text
+
+	// Extract and protect markdown link URLs
+	reMdLink := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	var extractedUrls []string
+	urlIdx := 0
+	text = reMdLink.ReplaceAllStringFunc(text, func(s string) string {
+		m := reMdLink.FindStringSubmatch(s)
+		if len(m) < 3 {
+			return s
+		}
+		extractedUrls = append(extractedUrls, m[2])
+		ph := fmt.Sprintf("\x00URL%d\x00", urlIdx)
+		urlIdx++
+		return fmt.Sprintf("[%s](%s)", m[1], ph)
+	})
 
 	// Strip markdown headers
 	text = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`).ReplaceAllString(text, "$1")
@@ -92,6 +107,11 @@ func markdownToTelegramHTML(text string) string {
 
 	// List items
 	text = regexp.MustCompile(`(?m)^[-*]\s+`).ReplaceAllString(text, "• ")
+
+	// Restore markdown URLs (escape them so `&` -> `&amp;` etc.)
+	for i, url := range extractedUrls {
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escapeHTML(url))
+	}
 
 	// Restore inline code
 	for i, code := range inlineCodes.codes {
