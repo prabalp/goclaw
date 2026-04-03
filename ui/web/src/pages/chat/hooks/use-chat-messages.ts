@@ -3,7 +3,9 @@ import { useWs } from "@/hooks/use-ws";
 import { useWsEvent } from "@/hooks/use-ws-event";
 import { Methods, Events } from "@/api/protocol";
 import type { Message } from "@/types/session";
-import type { ChatMessage, AgentEventPayload, ToolStreamEntry, RunActivity, ActiveTeamTask } from "@/types/chat";
+import type { ChatMessage, AgentEventPayload, ToolStreamEntry, RunActivity, ActiveTeamTask, MediaItem } from "@/types/chat";
+import { toFileUrl, mediaKindFromMime } from "@/lib/file-helpers";
+import { messageToTimestamp } from "@/lib/message-utils";
 
 /**
  * Manages chat message history and real-time streaming for a session.
@@ -32,8 +34,12 @@ export function useChatMessages(sessionKey: string, agentId: string) {
   const toolStreamRef = useRef<ToolStreamEntry[]>([]);
   const agentIdRef = useRef(agentId);
   agentIdRef.current = agentId;
+  const sessionKeyRef = useRef(sessionKey);
+  sessionKeyRef.current = sessionKey;
   const activityRef = useRef<RunActivity | null>(null);
   const blockRepliesRef = useRef<ChatMessage[]>([]);
+  const rafPendingRef = useRef(false);
+  const rafHandleRef = useRef(0);
 
   // Reset streaming/run state when session changes.
   // Messages are NOT cleared here — loadHistory() will replace them atomically.
@@ -41,7 +47,15 @@ export function useChatMessages(sessionKey: string, agentId: string) {
   const prevKeyRef = useRef(sessionKey);
   useEffect(() => {
     if (sessionKey === prevKeyRef.current) return;
+    const wasEmpty = !prevKeyRef.current;
     prevKeyRef.current = sessionKey;
+
+    // "" → newKey: part of new-chat send flow. run.started may have already
+    // captured runIdRef before this effect fires. Don't reset run state —
+    // there's no prior session state to clean up from an empty session.
+    if (wasEmpty) return;
+
+    // Session-to-session switch: full reset
     setStreamText(null);
     setThinkingText(null);
     setToolStream([]);
@@ -56,10 +70,17 @@ export function useChatMessages(sessionKey: string, agentId: string) {
     toolStreamRef.current = [];
     activityRef.current = null;
     blockRepliesRef.current = [];
+    cancelAnimationFrame(rafHandleRef.current);
+    rafPendingRef.current = false;
+    // Clear messages when navigating away from a session (empty key).
+    // When switching to another session, loadHistory() will replace them.
+    if (!sessionKey) {
+      setMessages([]);
+    }
   }, [sessionKey]);
 
   // Load history (no loading spinner — the empty state placeholder is shown instead)
-  const loadHistory = useCallback(async () => {
+  const loadHistory = useCallback(async (mediaItems?: MediaItem[]) => {
     if (!ws.isConnected || !sessionKey) {
       setLoading(false);
       return;
@@ -80,8 +101,17 @@ export function useChatMessages(sessionKey: string, agentId: string) {
       const msgs: ChatMessage[] = allMsgs.map((m: Message, i: number) => {
         const chatMsg: ChatMessage = {
           ...m,
-          timestamp: Date.now() - (allMsgs.length - i) * 1000,
+          timestamp: messageToTimestamp(m, i, allMsgs.length),
         };
+        // Convert persisted media_refs to mediaItems for gallery display
+        if (m.role === "assistant" && m.media_refs && m.media_refs.length > 0) {
+          chatMsg.mediaItems = m.media_refs.map((ref) => ({
+            path: toFileUrl(ref.path || ref.id),
+            mimeType: ref.mime_type,
+            fileName: (ref.path?.split("?")[0]?.split("/").pop()) ?? ref.id,
+            kind: (ref.kind as MediaItem["kind"]) || "document",
+          }));
+        }
         // Reconstruct toolDetails for assistant messages with tool_calls
         if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
           chatMsg.toolDetails = m.tool_calls.map((tc) => {
@@ -100,6 +130,15 @@ export function useChatMessages(sessionKey: string, agentId: string) {
         }
         return chatMsg;
       });
+      // Attach media to the last assistant message if provided
+      if (mediaItems?.length && msgs.length > 0) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i]!.role === "assistant") {
+            msgs[i] = { ...msgs[i]!, mediaItems };
+            break;
+          }
+        }
+      }
       setMessages(msgs);
     } catch {
       // will retry
@@ -108,12 +147,36 @@ export function useChatMessages(sessionKey: string, agentId: string) {
     }
   }, [ws, agentId, sessionKey]);
 
-  // Load history when session changes
+  // Load history, restore running state and active tasks when session changes.
+  // Cancelled flag prevents stale RPC responses from overwriting state on rapid switches.
   useEffect(() => {
+    let cancelled = false;
     if (sessionKey) {
       loadHistory();
+      // Restore session running state (including runId for event filtering)
+      ws.call<{ isRunning?: boolean; runId?: string; activity?: RunActivity }>(Methods.CHAT_SESSION_STATUS, { sessionKey })
+        .then((res) => {
+          if (cancelled) return;
+          if (res.isRunning) {
+            setIsRunning(true);
+            if (res.runId) runIdRef.current = res.runId;
+          }
+          if (res.activity) {
+            setActivity(res.activity);
+            activityRef.current = res.activity;
+          }
+        })
+        .catch(() => {});
+      // Restore active team tasks (teams module may not be configured)
+      ws.call<{ tasks?: ActiveTeamTask[] }>(Methods.TEAMS_TASK_ACTIVE_BY_SESSION, { sessionKey })
+        .then((res) => {
+          if (cancelled) return;
+          if (res.tasks && res.tasks.length > 0) setTeamTasks(res.tasks);
+        })
+        .catch(() => {});
     }
-  }, [sessionKey, loadHistory]);
+    return () => { cancelled = true; };
+  }, [sessionKey, loadHistory, ws]);
 
   // Called before sending a message so the event handler knows to capture run.started
   const expectRun = useCallback(() => {
@@ -126,16 +189,19 @@ export function useChatMessages(sessionKey: string, agentId: string) {
       const event = payload as AgentEventPayload;
       if (!event) return;
 
-      // Announce run.completed: reload history when a subagent/delegate announce finishes
-      // for the current agent (these runs aren't tracked by runIdRef).
-      if (event.type === "run.completed" && event.runKind === "announce" && event.agentId === agentIdRef.current) {
-        loadHistory();
+      // Only process events from WS channel targeting the active session.
+      // Delegations/announces (runKind set) are allowed regardless of channel.
+      if (event.channel && event.channel !== "ws" && !event.runKind) {
+        return;
+      }
+      if (event.sessionKey && event.sessionKey !== sessionKeyRef.current) {
         return;
       }
 
-      // Capture run.started when we are expecting a run for this agent
-      if (event.type === "run.started") {
-        if (expectingRunRef.current && event.agentId === agentIdRef.current) {
+      // Capture run.started when we are expecting a run for this agent,
+      // OR when an announce run starts (leader summarising team results).
+      if (event.type === "run.started" && event.agentId === agentIdRef.current) {
+        if (expectingRunRef.current || event.runKind === "announce") {
           runIdRef.current = event.runId;
           expectingRunRef.current = false;
           setIsRunning(true);
@@ -156,13 +222,29 @@ export function useChatMessages(sessionKey: string, agentId: string) {
         case "thinking": {
           const content = event.payload?.content ?? "";
           thinkingRef.current += content;
-          setThinkingText(thinkingRef.current);
+          // Batch state updates: only one setState per animation frame
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = true;
+            rafHandleRef.current = requestAnimationFrame(() => {
+              rafPendingRef.current = false;
+              setThinkingText(thinkingRef.current);
+              setStreamText(streamRef.current);
+            });
+          }
           break;
         }
         case "chunk": {
           const content = event.payload?.content ?? "";
           streamRef.current += content;
-          setStreamText(streamRef.current);
+          // Batch state updates: only one setState per animation frame
+          if (!rafPendingRef.current) {
+            rafPendingRef.current = true;
+            rafHandleRef.current = requestAnimationFrame(() => {
+              rafPendingRef.current = false;
+              setStreamText(streamRef.current);
+              setThinkingText(thinkingRef.current);
+            });
+          }
           break;
         }
         case "tool.call": {
@@ -238,6 +320,10 @@ export function useChatMessages(sessionKey: string, agentId: string) {
           break;
         }
         case "run.completed": {
+          // Cancel any pending rAF to prevent stale state overwrite
+          cancelAnimationFrame(rafHandleRef.current);
+          rafPendingRef.current = false;
+
           setIsRunning(false);
           runIdRef.current = null;
 
@@ -258,17 +344,32 @@ export function useChatMessages(sessionKey: string, agentId: string) {
           blockRepliesRef.current = [];
           setBlockReplies([]);
 
+          // Convert media from run.completed event to MediaItem[]
+          const rawMedia = event.payload?.media;
+          const mediaItems: MediaItem[] | undefined = rawMedia?.length
+            ? rawMedia.map((m) => ({
+                path: toFileUrl(m.path),
+                mimeType: m.content_type ?? "application/octet-stream",
+                fileName: m.path.split("?")[0]?.split("/").pop() ?? "file",
+                size: m.size,
+                kind: mediaKindFromMime(m.content_type ?? ""),
+              }))
+            : undefined;
+
           if (streamed && !hadTools) {
             setMessages((prev) => [
               ...prev,
-              { role: "assistant", content: streamed, timestamp: Date.now() },
+              { role: "assistant", content: streamed, timestamp: Date.now(), mediaItems },
             ]);
           } else {
-            loadHistory();
+            loadHistory(mediaItems);
           }
           break;
         }
         case "run.failed": {
+          cancelAnimationFrame(rafHandleRef.current);
+          rafPendingRef.current = false;
+
           setIsRunning(false);
           runIdRef.current = null;
           setStreamText(null);
@@ -288,6 +389,37 @@ export function useChatMessages(sessionKey: string, agentId: string) {
               timestamp: Date.now(),
             },
           ]);
+          break;
+        }
+        // User-initiated cancellation — clear state, preserve partial content.
+        case "run.cancelled": {
+          cancelAnimationFrame(rafHandleRef.current);
+          rafPendingRef.current = false;
+
+          setIsRunning(false);
+          runIdRef.current = null;
+
+          const streamed = streamRef.current;
+          setStreamText(null);
+          setThinkingText(null);
+          setToolStream([]);
+          streamRef.current = "";
+          thinkingRef.current = "";
+          toolStreamRef.current = [];
+          activityRef.current = null;
+          setActivity(null);
+          blockRepliesRef.current = [];
+          setBlockReplies([]);
+
+          // Promote partial streamed text or reload history
+          if (streamed) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: streamed, timestamp: Date.now() },
+            ]);
+          } else {
+            loadHistory();
+          }
           break;
         }
       }
@@ -311,8 +443,15 @@ export function useChatMessages(sessionKey: string, agentId: string) {
         progress_percent?: number;
         progress_step?: string;
         reason?: string;
+        channel?: string;
       };
       if (!event?.team_id) return;
+
+      // Only process team task events from WS channel (matches handleAgentEvent filter).
+      // Prevents channel events (Telegram, Discord, etc.) leaking into web UI chat.
+      if (event.channel && event.channel !== "ws") {
+        return;
+      }
 
       setTeamTasks((prev) => {
         const existing = prev.find((t) => t.taskId === event.task_id);
@@ -354,6 +493,18 @@ export function useChatMessages(sessionKey: string, agentId: string) {
           return prev.filter((t) => t.taskId !== event.task_id);
         }
 
+        // Increment counters for comment/attachment events
+        if (eventName === "team.task.commented" && existing) {
+          return prev.map((t) =>
+            t.taskId === event.task_id ? { ...t, commentCount: (t.commentCount ?? 0) + 1 } : t,
+          );
+        }
+        if (eventName === "team.task.attachment_added" && existing) {
+          return prev.map((t) =>
+            t.taskId === event.task_id ? { ...t, attachmentCount: (t.attachmentCount ?? 0) + 1 } : t,
+          );
+        }
+
         return prev;
       });
 
@@ -361,7 +512,9 @@ export function useChatMessages(sessionKey: string, agentId: string) {
       if (
         eventName === "team.task.dispatched" ||
         eventName === "team.task.completed" ||
-        eventName === "team.task.failed"
+        eventName === "team.task.failed" ||
+        eventName === "team.task.commented" ||
+        eventName === "team.task.attachment_added"
       ) {
         let icon = "📋";
         let text = "";
@@ -371,6 +524,12 @@ export function useChatMessages(sessionKey: string, agentId: string) {
         } else if (eventName === "team.task.failed") {
           icon = "❌";
           text = `Task #${event.task_number} "${event.subject}" failed${event.reason ? ": " + event.reason : ""}`;
+        } else if (eventName === "team.task.commented") {
+          icon = "💬";
+          text = `Comment on #${event.task_number} "${event.subject}"`;
+        } else if (eventName === "team.task.attachment_added") {
+          icon = "📎";
+          text = `File attached to #${event.task_number} "${event.subject}"`;
         } else {
           icon = "📋";
           text = `Task #${event.task_number} "${event.subject}" → ${event.owner_display_name || event.owner_agent_key}`;
@@ -398,6 +557,8 @@ export function useChatMessages(sessionKey: string, agentId: string) {
   const onTaskCancelled = useMemo(() => handleTeamTaskEvent("team.task.cancelled"), [handleTeamTaskEvent]);
   const onTaskProgress = useMemo(() => handleTeamTaskEvent("team.task.progress"), [handleTeamTaskEvent]);
   const onTaskAssigned = useMemo(() => handleTeamTaskEvent("team.task.assigned"), [handleTeamTaskEvent]);
+  const onTaskCommented = useMemo(() => handleTeamTaskEvent("team.task.commented"), [handleTeamTaskEvent]);
+  const onTaskAttached = useMemo(() => handleTeamTaskEvent("team.task.attachment_added"), [handleTeamTaskEvent]);
 
   useWsEvent(Events.TEAM_TASK_DISPATCHED, onTaskDispatched);
   useWsEvent(Events.TEAM_TASK_COMPLETED, onTaskCompleted);
@@ -405,11 +566,27 @@ export function useChatMessages(sessionKey: string, agentId: string) {
   useWsEvent(Events.TEAM_TASK_CANCELLED, onTaskCancelled);
   useWsEvent(Events.TEAM_TASK_PROGRESS, onTaskProgress);
   useWsEvent(Events.TEAM_TASK_ASSIGNED, onTaskAssigned);
+  useWsEvent(Events.TEAM_TASK_COMMENTED, onTaskCommented);
+  useWsEvent(Events.TEAM_TASK_ATTACHMENT_ADDED, onTaskAttached);
+
+  // Leader processing: backend emits when announce queue drains (before announce run starts).
+  const handleLeaderProcessing = useCallback((payload: unknown) => {
+    const event = payload as { agentId?: string; tasks?: number };
+    if (event?.agentId === agentIdRef.current) {
+      activityRef.current = { phase: "leader_processing" };
+      setActivity(activityRef.current);
+    }
+  }, []);
+  useWsEvent(Events.TEAM_LEADER_PROCESSING, handleLeaderProcessing);
 
   // Add a local message optimistically (shown immediately, replaced on next loadHistory)
   const addLocalMessage = useCallback((msg: ChatMessage) => {
     setMessages((prev) => [...prev, msg]);
   }, []);
+
+  // isBusy: true when main agent is running, team tasks are active,
+  // or leader is processing team results before announce run starts.
+  const isBusy = isRunning || teamTasks.length > 0 || activity?.phase === "leader_processing";
 
   return {
     messages,
@@ -417,6 +594,7 @@ export function useChatMessages(sessionKey: string, agentId: string) {
     thinkingText,
     toolStream,
     isRunning,
+    isBusy,
     loading,
     activity,
     blockReplies,

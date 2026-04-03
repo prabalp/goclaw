@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -70,8 +69,10 @@ func NewSandboxedReadFileTool(workspace string, restrict bool, mgr sandbox.Manag
 // SetSandboxKey is a no-op; sandbox key is now read from ctx (thread-safe).
 func (t *ReadFileTool) SetSandboxKey(key string) {}
 
-func (t *ReadFileTool) Name() string        { return "read_file" }
-func (t *ReadFileTool) Description() string { return "Read the contents of a file" }
+func (t *ReadFileTool) Name() string { return "read_file" }
+func (t *ReadFileTool) Description() string {
+	return "Read the contents of a file. For large files, use offset and limit to read specific line ranges."
+}
 func (t *ReadFileTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -79,6 +80,14 @@ func (t *ReadFileTool) Parameters() map[string]any {
 			"path": map[string]any{
 				"type":        "string",
 				"description": "File path (relative to workspace, or absolute)",
+			},
+			"offset": map[string]any{
+				"type":        "integer",
+				"description": "Start reading from this line number (0-indexed). Defaults to 0.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"description": "Maximum number of lines to return. Omit to read until output cap.",
 			},
 		},
 		"required": []string{"path"},
@@ -137,7 +146,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
 	if t.sandboxMgr != nil && sandboxKey != "" {
-		return t.executeInSandbox(ctx, path, sandboxKey)
+		return t.executeInSandbox(ctx, path, sandboxKey, args)
 	}
 
 	// Host execution — use per-user workspace from context if available
@@ -171,10 +180,10 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return ErrorResult(msg)
 	}
 
-	return SilentResult(string(data))
+	return t.paginateOutput(string(data), args)
 }
 
-func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey string) *Result {
+func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey string, args map[string]any) *Result {
 	bridge, err := t.getFsBridge(ctx, sandboxKey)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
@@ -191,7 +200,7 @@ func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey st
 		return ErrorResult(fmt.Sprintf("failed to read file: %v", err) + MaybeFsBridgeHint(err))
 	}
 
-	return SilentResult(data)
+	return t.paginateOutput(data, args)
 }
 
 func (t *ReadFileTool) getFsBridge(ctx context.Context, sandboxKey string) (*sandbox.FsBridge, error) {
@@ -200,6 +209,87 @@ func (t *ReadFileTool) getFsBridge(ctx context.Context, sandboxKey string) (*san
 		return nil, err
 	}
 	return sandbox.NewFsBridge(sb.ID(), sandbox.DefaultContainerWorkdir), nil
+}
+
+// readFileMaxChars is the output cap for read_file. Large files require offset/limit pagination.
+const readFileMaxChars = 50000
+
+// paginateOutput applies offset/limit slicing and output capping to file content.
+// Returns a SilentResult with pagination metadata when the output is truncated.
+func (t *ReadFileTool) paginateOutput(content string, args map[string]any) *Result {
+	lines := strings.Split(content, "\n")
+	totalLines := len(lines)
+
+	// Parse offset (0-indexed line number).
+	offset := 0
+	if v, ok := args["offset"]; ok {
+		switch n := v.(type) {
+		case float64:
+			offset = int(n)
+		case int:
+			offset = n
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= totalLines {
+		return SilentResult(fmt.Sprintf("(offset %d exceeds file length of %d lines)", offset, totalLines))
+	}
+
+	// Parse limit (max lines to return).
+	limit := 0 // 0 = no explicit limit
+	if v, ok := args["limit"]; ok {
+		switch n := v.(type) {
+		case float64:
+			limit = int(n)
+		case int:
+			limit = n
+		}
+	}
+
+	// Slice lines by offset and limit.
+	sliced := lines[offset:]
+	if limit > 0 && limit < len(sliced) {
+		sliced = sliced[:limit]
+	}
+
+	output := strings.Join(sliced, "\n")
+	shownLines := len(sliced)
+	endLine := offset + shownLines
+
+	// Check output char cap.
+	runeCount := len([]rune(output))
+	if runeCount <= readFileMaxChars {
+		// Fits within cap — add line info if offset was used or file was partially read.
+		if offset > 0 || endLine < totalLines {
+			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d total]", offset, endLine-1, totalLines)
+		}
+		return SilentResult(output)
+	}
+
+	// Output exceeds cap — truncate at line boundary within budget.
+	charCount := 0
+	truncIdx := len(sliced)
+	for i, line := range sliced {
+		charCount += len([]rune(line)) + 1 // +1 for newline
+		if charCount > readFileMaxChars {
+			truncIdx = i
+			break
+		}
+	}
+	if truncIdx < 1 {
+		truncIdx = 1
+	}
+
+	output = strings.Join(sliced[:truncIdx], "\n")
+	shownLines = truncIdx
+	nextOffset := offset + shownLines
+
+	output += fmt.Sprintf("\n\n[Output capped. File has %d lines, showed %d (lines %d-%d). Use offset=%d to continue reading.]",
+		totalLines, shownLines, offset, offset+shownLines-1, nextOffset)
+
+	return SilentResult(output)
 }
 
 // allowedWithTeamWorkspace returns the allowed prefixes with team workspace appended
@@ -428,49 +518,3 @@ func resolveThroughExistingAncestors(target string) (string, error) {
 	return filepath.Clean(target), nil
 }
 
-// hasMutableSymlinkParent checks if any component of the resolved path is a symlink
-// whose parent directory is writable by the current process. A writable parent means
-// the symlink could be replaced between path resolution and actual file operation
-// (TOCTOU symlink rebind attack).
-func hasMutableSymlinkParent(path string) bool {
-	clean := filepath.Clean(path)
-	components := strings.Split(clean, string(filepath.Separator))
-	current := string(filepath.Separator)
-	for _, comp := range components {
-		if comp == "" {
-			continue
-		}
-		current = filepath.Join(current, comp)
-		info, err := os.Lstat(current)
-		if err != nil {
-			break // non-existent — stop checking
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			// Symlink found — check if its parent dir is writable
-			parentDir := filepath.Dir(current)
-			if syscall.Access(parentDir, 0x2 /* W_OK */) == nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// checkHardlink rejects regular files with nlink > 1 (hardlink attack prevention).
-// Directories naturally have nlink > 1 and are exempt.
-func checkHardlink(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil // non-existent files are OK — will fail at read/write
-	}
-	if info.IsDir() {
-		return nil
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		if stat.Nlink > 1 {
-			slog.Warn("security.hardlink_rejected", "path", path, "nlink", stat.Nlink)
-			return fmt.Errorf("access denied: hardlinked file not allowed")
-		}
-	}
-	return nil
-}

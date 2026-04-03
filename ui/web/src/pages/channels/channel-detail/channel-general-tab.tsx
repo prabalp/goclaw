@@ -17,7 +17,10 @@ import type { ChannelInstanceData } from "@/types/channel";
 import type { AgentData } from "@/types/agent";
 import { channelTypeLabels } from "../channels-status-view";
 
-const ESSENTIAL_CONFIG_KEYS = ["dm_policy", "group_policy", "require_mention"];
+const ESSENTIAL_CONFIG_KEYS: Record<string, string[]> = {
+  _default: ["dm_policy", "group_policy", "require_mention"],
+  telegram: ["dm_policy", "group_policy", "mention_mode", "require_mention"],
+};
 
 interface ChannelGeneralTabProps {
   instance: ChannelInstanceData;
@@ -34,18 +37,17 @@ export function ChannelGeneralTab({ instance, agents, onUpdate }: ChannelGeneral
 
   // Essential config fields (policies)
   const allConfigFields = configSchema[instance.channel_type] ?? [];
-  const essentialFields = allConfigFields.filter((f) => ESSENTIAL_CONFIG_KEYS.includes(f.key));
+  const essentialKeys = ESSENTIAL_CONFIG_KEYS[instance.channel_type] ?? ESSENTIAL_CONFIG_KEYS._default ?? [];
+  const essentialFields = allConfigFields.filter((f) => essentialKeys.includes(f.key));
   const existingConfig = (instance.config ?? {}) as Record<string, unknown>;
   const initialPolicyValues = Object.fromEntries(
-    ESSENTIAL_CONFIG_KEYS
+    essentialKeys
       .filter((k) => existingConfig[k] !== undefined)
       .map((k) => [k, existingConfig[k]]),
   );
   const [policyValues, setPolicyValues] = useState<Record<string, unknown>>(initialPolicyValues);
 
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
 
   const handlePolicyChange = useCallback((key: string, value: unknown) => {
     setPolicyValues((prev) => ({ ...prev, [key]: value }));
@@ -53,8 +55,6 @@ export function ChannelGeneralTab({ instance, agents, onUpdate }: ChannelGeneral
 
   const handleSave = async () => {
     setSaving(true);
-    setSaveError(null);
-    setSaved(false);
     try {
       // Merge policy values into existing config, preserving other keys (groups, advanced)
       const cleanPolicies = Object.fromEntries(
@@ -67,10 +67,8 @@ export function ChannelGeneralTab({ instance, agents, onUpdate }: ChannelGeneral
         enabled,
         config: mergedConfig,
       });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : t("form.errors.failedSave"));
+    } catch {
+      // toast shown by hook
     } finally {
       setSaving(false);
     }
@@ -139,6 +137,7 @@ export function ChannelGeneralTab({ instance, agents, onUpdate }: ChannelGeneral
             values={policyValues}
             onChange={handlePolicyChange}
             idPrefix="cd-pol"
+            contextValues={policyValues}
           />
         </section>
       )}
@@ -146,11 +145,8 @@ export function ChannelGeneralTab({ instance, agents, onUpdate }: ChannelGeneral
       <StickySaveBar
         onSave={handleSave}
         saving={saving}
-        saved={saved}
-        error={saveError}
         label={t("detail.general.saveChanges")}
         savingLabel={t("detail.general.saving")}
-        savedLabel={t("detail.general.saved")}
       />
     </div>
   );

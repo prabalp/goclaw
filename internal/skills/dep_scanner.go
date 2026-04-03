@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,6 +35,7 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 
 	entries, err := os.ReadDir(scriptsDir)
 	if err != nil {
+		slog.Debug("dep_scanner: scripts dir not found", "dir", scriptsDir, "error", err)
 		return m
 	}
 
@@ -42,6 +44,8 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 	binaries := make(map[string]bool)
 	// Track subdirectory names — these are local modules and must never be reported as missing.
 	localModules := make(map[string]bool)
+	// The scripts directory itself can be referenced as a module (e.g. "from scripts import utils").
+	localModules[filepath.Base(scriptsDir)] = true
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -53,6 +57,19 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 			}
 			for _, se := range subEntries {
 				if se.IsDir() {
+					// Track nested subdirs as local modules too (e.g. office/helpers, office/validators)
+					// so intra-package imports like "from helpers import ..." don't get falsely reported.
+					localModules[se.Name()] = true
+					// Scan files inside nested subdirs
+					nestedEntries, err := os.ReadDir(filepath.Join(scriptsDir, e.Name(), se.Name()))
+					if err != nil {
+						continue
+					}
+					for _, ne := range nestedEntries {
+						if !ne.IsDir() {
+							scanFile(filepath.Join(scriptsDir, e.Name(), se.Name(), ne.Name()), pyImports, nodeImports, binaries)
+						}
+					}
 					continue
 				}
 				scanFile(filepath.Join(scriptsDir, e.Name(), se.Name()), pyImports, nodeImports, binaries)
@@ -70,10 +87,11 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 	for b := range binaries {
 		m.Requires = append(m.Requires, b)
 	}
-	// Store raw import names — skip local module dirs (subdirs of scriptsDir).
-	// dep_checker.go handles stdlib/pip resolution via PYTHONPATH.
+	// Store raw import names — skip local modules and Python stdlib.
+	// Stdlib is also resolved at check time via actual import, but filtering here
+	// prevents false positives when the checker fails (timeout, env issue, crash).
 	for pkg := range pyImports {
-		if !localModules[pkg] {
+		if !localModules[pkg] && !pythonStdlib[pkg] {
 			m.RequiresPython = append(m.RequiresPython, pkg)
 		}
 	}
@@ -89,6 +107,11 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 		m.Requires = append(m.Requires, "node")
 	}
 
+	if !m.IsEmpty() {
+		slog.Debug("dep_scanner: scanned", "dir", scriptsDir,
+			"bins", len(m.Requires), "py", len(m.RequiresPython), "node", len(m.RequiresNode))
+	}
+
 	return m
 }
 
@@ -98,6 +121,9 @@ var (
 	nodeRequireRe  = regexp.MustCompile(`require\(['"]([\w@][^'"]*)['"]\)`)
 	nodeESImportRe = regexp.MustCompile(`from\s+['"]([^'"./][^'"]*?)['"]`)
 	shebangRe      = regexp.MustCompile(`^#!\s*/usr/bin/env\s+(\S+)`)
+	// Detects JS ES module pattern: `import X from '...'` or `from '...'`.
+	// Used to skip false positives when JS imports appear inside Python string literals.
+	jsFromStringRe = regexp.MustCompile(`from\s+['"]`)
 )
 
 func scanFile(path string, pyImports, nodeImports map[string]bool, binaries map[string]bool) {
@@ -121,7 +147,10 @@ func scanFile(path string, pyImports, nodeImports map[string]bool, binaries map[
 		for _, line := range strings.Split(content, "\n") {
 			line = strings.TrimSpace(line)
 			if m := pyImportRe.FindStringSubmatch(line); len(m) > 1 {
-				pyImports[m[1]] = true
+				// Skip JS ES module imports inside string literals (e.g. `import mermaid from '...'`)
+				if !jsFromStringRe.MatchString(line) {
+					pyImports[m[1]] = true
+				}
 			}
 			if m := pyFromRe.FindStringSubmatch(line); len(m) > 1 {
 				pyImports[m[1]] = true
