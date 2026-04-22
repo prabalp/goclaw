@@ -24,8 +24,9 @@ type Stores struct {
 	Contacts         ContactStore
 	Activity         ActivityStore
 	Snapshots        SnapshotStore
-	SecureCLI        SecureCLIStore
-	APIKeys           APIKeyStore
+	SecureCLI           SecureCLIStore
+	SecureCLIGrants     SecureCLIAgentGrantStore
+	APIKeys             APIKeyStore
 	Heartbeats        HeartbeatStore
 	ConfigPermissions      ConfigPermissionStore
 	Tenants                TenantStore
@@ -33,4 +34,12 @@ type Stores struct {
 	SkillTenantCfgs        SkillTenantConfigStore
 	SystemConfigs          SystemConfigStore
 	SubagentTasks          SubagentTaskStore
+	Vault                  VaultStore
+	Episodic               EpisodicStore
+	EvolutionMetrics       EvolutionMetricsStore
+	EvolutionSuggestions   EvolutionSuggestionStore
+	// Hooks is hooks.HookStore — typed as any to avoid import cycle
+	// (hooks package imports store for context helpers).
+	// Callers: type-assert to hooks.HookStore before use.
+	Hooks any
 }

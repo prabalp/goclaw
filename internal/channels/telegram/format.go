@@ -21,8 +21,10 @@ var htmlToMdReplacers = []struct {
 	{regexp.MustCompile(`(?i)</?p\s*>`), "\n"},
 	{regexp.MustCompile(`(?i)<b>([\s\S]*?)</b>`), "**$1**"},
 	{regexp.MustCompile(`(?i)<strong>([\s\S]*?)</strong>`), "**$1**"},
-	{regexp.MustCompile(`(?i)<i>([\s\S]*?)</i>`), "_$1_"},
-	{regexp.MustCompile(`(?i)<em>([\s\S]*?)</em>`), "_$1_"},
+	// ${1}_ (not $1_) — Go regexp treats $1_ as a named group reference (identifier
+	// characters include `_`), which drops the capture. Curly braces delimit the group.
+	{regexp.MustCompile(`(?i)<i>([\s\S]*?)</i>`), "_${1}_"},
+	{regexp.MustCompile(`(?i)<em>([\s\S]*?)</em>`), "_${1}_"},
 	{regexp.MustCompile(`(?i)<s>([\s\S]*?)</s>`), "~~$1~~"},
 	{regexp.MustCompile(`(?i)<strike>([\s\S]*?)</strike>`), "~~$1~~"},
 	{regexp.MustCompile(`(?i)<del>([\s\S]*?)</del>`), "~~$1~~"},
@@ -62,21 +64,47 @@ func markdownToTelegramHTML(text string) string {
 	text = inlineCodes.text
 
 	// Extract and protect markdown link URLs
-	reMdLink := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
-	var extractedUrls []string
-	urlIdx := 0
-	text = reMdLink.ReplaceAllStringFunc(text, func(s string) string {
-		m := reMdLink.FindStringSubmatch(s)
-		if len(m) < 3 {
-			return s
-		}
-		extractedUrls = append(extractedUrls, m[2])
-		ph := fmt.Sprintf("\x00URL%d\x00", urlIdx)
-		urlIdx++
-		return fmt.Sprintf("[%s](%s)", m[1], ph)
-	})
+	// reMdLink := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	// var extractedUrls []string
+	// urlIdx := 0
+	// text = reMdLink.ReplaceAllStringFunc(text, func(s string) string {
+	// 	m := reMdLink.FindStringSubmatch(s)
+	// 	if len(m) < 3 {
+	// 		return s
+	// 	}
+	// 	extractedUrls = append(extractedUrls, m[2])
+	// 	ph := fmt.Sprintf("\x00URL%d\x00", urlIdx)
+	// 	urlIdx++
+	// 	return fmt.Sprintf("[%s](%s)", m[1], ph)
+	// })
 
-	// Strip markdown headers
+
+	// Extract and protect bare URLs from italic parsing.
+	// URLs with underscores (e.g. syngas_dailymail_2026_ai) get broken by
+	// the italic regex which matches _text_ patterns inside URLs.
+	var urlPlaceholders []string
+	reURL := regexp.MustCompile(`https?://[^\s<>\)\]]+`)
+	text = reURL.ReplaceAllStringFunc(text, func(s string) string {
+		idx := len(urlPlaceholders)
+		urlPlaceholders = append(urlPlaceholders, s)
+		return fmt.Sprintf("\x00URL%d\x00", idx)
+	})
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Strip markdown headers
 	text = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`).ReplaceAllString(text, "$1")
 
 	// Strip blockquotes
@@ -131,8 +159,12 @@ func markdownToTelegramHTML(text string) string {
 	text = regexp.MustCompile(`(?m)^[-*]\s+`).ReplaceAllString(text, "• ")
 
 	// Restore markdown URLs (escape them so `&` -> `&amp;` etc.)
-	for i, url := range extractedUrls {
-		text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escapeHTML(url))
+	// for i, url := range extractedUrls {
+	// 	text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escapeHTML(url))
+	// Restore bare URLs (protected from italic parsing above).
+	for i, u := range urlPlaceholders {
+		escaped := escapeHTML(u)
+		text = strings.ReplaceAll(text, fmt.Sprintf("\x00URL%d\x00", i), escaped)
 	}
 
 	// Restore inline code

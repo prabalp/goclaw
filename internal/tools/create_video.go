@@ -15,13 +15,14 @@ import (
 )
 
 // videoGenProviderPriority is the default order for video generation providers.
-var videoGenProviderPriority = []string{"gemini", "minimax", "openrouter"}
+var videoGenProviderPriority = []string{"gemini", "minimax", "openrouter", "byteplus"}
 
 // videoGenModelDefaults maps provider names to default video generation models.
 var videoGenModelDefaults = map[string]string{
 	"gemini":     "veo-3.1-lite-generate-preview",
 	"minimax":    "MiniMax-Hailuo-2.3",
 	"openrouter": "google/veo-3.1-lite-generate-preview",
+	"byteplus":   "seedance-1-5-pro",
 }
 
 // maxImageToVideoBytes is the maximum image file size for image-to-video (20 MB).
@@ -30,8 +31,11 @@ const maxImageToVideoBytes = 20 * 1024 * 1024
 // CreateVideoTool generates videos using a video generation API.
 // Uses Gemini Veo via predictLongRunning API (async with polling).
 type CreateVideoTool struct {
-	registry *providers.Registry
+	registry  *providers.Registry
+	vaultIntc *VaultInterceptor
 }
+
+func (t *CreateVideoTool) SetVaultInterceptor(v *VaultInterceptor) { t.vaultIntc = v }
 
 func NewCreateVideoTool(registry *providers.Registry) *CreateVideoTool {
 	return &CreateVideoTool{registry: registry}
@@ -191,8 +195,11 @@ func (t *CreateVideoTool) Execute(ctx context.Context, args map[string]any) *Res
 	}
 
 	result := &Result{ForLLM: fmt.Sprintf("MEDIA:%s\nUse the EXACT filename when referencing: %s", videoPath, filepath.Base(videoPath))}
-	result.Media = []bus.MediaFile{{Path: videoPath, MimeType: "video/mp4"}}
+	result.Media = []bus.MediaFile{{Path: videoPath, MimeType: "video/mp4", Filename: filepath.Base(videoPath)}}
 	result.Deliverable = fmt.Sprintf("[Generated video: %s]\nPrompt: %s", filepath.Base(videoPath), prompt)
+	if t.vaultIntc != nil {
+		go t.vaultIntc.AfterWriteMedia(context.WithoutCancel(ctx), videoPath, prompt, "video/mp4")
+	}
 	result.Provider = chainResult.Provider
 	result.Model = chainResult.Model
 	if chainResult.Usage != nil {
@@ -218,6 +225,8 @@ func (t *CreateVideoTool) callProvider(ctx context.Context, cp credentialProvide
 		return t.callGeminiVideoGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, duration, aspectRatio, params)
 	case "minimax":
 		return callMinimaxVideoGen(ctx, cp.APIKey(), cp.APIBase(), model, params)
+	case "byteplus":
+		return callBytePlusVideoGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, duration, aspectRatio, params)
 	default:
 		return t.callChatVideoGen(ctx, cp.APIKey(), cp.APIBase(), model, prompt, duration, aspectRatio, params)
 	}
